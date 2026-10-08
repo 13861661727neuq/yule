@@ -1,0 +1,26 @@
+{
+  "deepseek": {
+    "api_key": "在这里填写你的DeepSeek_API_Key（sk-开头）",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-chat",
+    "system_prompt": "你是一个友好、简洁、准确的 QQ 智能助手，始终用中文回答。",
+    "temperature": 0.7,
+    "max_tokens": 1024
+  },
+  "onebot": {
+    "ws_url": "ws://127.0.0.1:3001"
+  },
+  "bot": {
+    "auto_reply_enabled": true,
+    "reply_trigger": "at_me",
+    "reply_to_self": false,
+    "history_size": 10,
+    "cooldown_seconds": 1,
+    "timeout_seconds": 60,
+    "admin_qq": 0,
+    "wake_words": []
+  },
+  "log": {
+    "level": "info"
+  }
+}
