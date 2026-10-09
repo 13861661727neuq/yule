@@ -200,6 +200,9 @@ struct Config
     long long admin_qq = 0;                // 0 表示所有人可开关；否则仅该 QQ 号可开关
     std::vector<std::string> wake_words;   // 群聊中命中这些关键词也触发回复
 
+    struct CannedReply { std::vector<std::string> keywords; std::string reply; };
+    std::vector<CannedReply> canned_replies;  // 关键词固定回复（命中即回固定文本）
+
     std::string log_level = "info";
 };
 
@@ -257,6 +260,18 @@ static bool load_config()
     {
         g_cfg.wake_words.clear();
         for (auto& w : b["wake_words"]) if (w.is_string()) g_cfg.wake_words.push_back(w.get<std::string>());
+    }
+    if (b.contains("canned_replies") && b["canned_replies"].is_array())
+    {
+        g_cfg.canned_replies.clear();
+        for (auto& cr : b["canned_replies"])
+        {
+            Config::CannedReply c;
+            if (cr.contains("keywords") && cr["keywords"].is_array())
+                for (auto& k : cr["keywords"]) if (k.is_string()) c.keywords.push_back(k.get<std::string>());
+            if (cr.contains("reply") && cr["reply"].is_string()) c.reply = cr["reply"].get<std::string>();
+            if (!c.keywords.empty() && !c.reply.empty()) g_cfg.canned_replies.push_back(c);
+        }
     }
 
     auto& l = g_cfgJson.value("log", json::object());
@@ -338,7 +353,7 @@ static HttpResult http_post_json(const std::string& url,
     if (!u.ok) { res.body = "URL 解析失败"; return res; }
 
     HINTERNET session = WinHttpOpen(L"QQ-DeepSeek-Bot/1.0",
-                                    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) { res.body = "WinHttpOpen 失败"; return res; }
     WinHttpSetTimeouts(session, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
@@ -443,30 +458,34 @@ static HINTERNET g_ws = nullptr;   // 全局当前 WebSocket 句柄
 static bool ws_connect(const std::string& url, Ws& c)
 {
     Url u = parse_url(url);
-    if (!u.ok) return false;
+    if (!u.ok) { log_error("WebSocket URL 解析失败: " + url); return false; }
 
     c.session = WinHttpOpen(L"QQ-DeepSeek-Bot/1.0",
-                            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                            WINHTTP_ACCESS_TYPE_NO_PROXY,
                             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!c.session) return false;
+    if (!c.session) { log_error("WinHttpOpen 失败，错误码 " + std::to_string(GetLastError())); return false; }
     WinHttpSetTimeouts(c.session, 30000, 30000, 30000, 0xFFFFFFFF);
 
     DWORD flags = u.secure ? WINHTTP_FLAG_SECURE : 0;
     c.conn = WinHttpConnect(c.session, utf8_to_wide(u.host).c_str(), (INTERNET_PORT)u.port, 0);
-    if (!c.conn) return false;
+    if (!c.conn) { log_error("WinHttpConnect 失败，错误码 " + std::to_string(GetLastError())); return false; }
 
     std::string path = u.path.empty() ? "/" : u.path;
     HINTERNET req = WinHttpOpenRequest(c.conn, L"GET", utf8_to_wide(path).c_str(),
                                        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!req) return false;
+    if (!req) { log_error("WinHttpOpenRequest 失败，错误码 " + std::to_string(GetLastError())); return false; }
+
+    // 关键：标记此请求为 WebSocket 升级（需在发送前设置）
+    if (!WinHttpSetOption(req, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0)) { log_error("SetOption UPGRADE_TO_WEB_SOCKET 失败，错误码 " + std::to_string(GetLastError())); WinHttpCloseHandle(req); return false; }
 
     std::wstring hdr = L"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: "
                        + utf8_to_wide(make_ws_key()) + L"\r\n";
-    if (!WinHttpAddRequestHeaders(req, hdr.c_str(), (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD)) { WinHttpCloseHandle(req); return false; }
-    if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) { WinHttpCloseHandle(req); return false; }
+    if (!WinHttpAddRequestHeaders(req, hdr.c_str(), (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD)) { log_error("AddRequestHeaders 失败，错误码 " + std::to_string(GetLastError())); WinHttpCloseHandle(req); return false; }
+    if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) { log_error("SendRequest 失败，错误码 " + std::to_string(GetLastError())); WinHttpCloseHandle(req); return false; }
+    if (!WinHttpReceiveResponse(req, NULL)) { log_error("ReceiveResponse 失败，错误码 " + std::to_string(GetLastError())); WinHttpCloseHandle(req); return false; }
 
     c.ws = WinHttpWebSocketCompleteUpgrade(req, 0);
-    if (!c.ws) { WinHttpCloseHandle(req); return false; }
+    if (!c.ws) { log_error("CompleteUpgrade 失败，错误码 " + std::to_string(GetLastError())); WinHttpCloseHandle(req); return false; }
     return true;
 }
 
@@ -668,6 +687,18 @@ static void do_auto_reply(const json& ev)
     send_reply(ev, reply);
 }
 
+// ---- 关键词匹配辅助 ----
+static std::string to_lower(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return s;
+}
+
+static bool contains_ignore_case(const std::string& haystack, const std::string& needle)
+{
+    return to_lower(haystack).find(to_lower(needle)) != std::string::npos;
+}
+
 // ---- 事件处理 ----
 static void handle_message(const json& ev)
 {
@@ -718,6 +749,23 @@ static void handle_message(const json& ev)
 
     // 命令消息不再触发智能回复
     if (cmd != Cmd::None) return;
+
+    // 关键词固定回复（私聊直接触发；群聊需 @我 或全部消息模式）
+    if (mt == "private" || mentioned || g_cfg.reply_trigger == "all")
+    {
+        for (auto& cr : g_cfg.canned_replies)
+        {
+            bool hit = false;
+            for (auto& k : cr.keywords)
+                if (contains_ignore_case(text, k)) { hit = true; break; }
+            if (hit)
+            {
+                log_info("命中固定回复关键词（" + session_key(ev) + "）");
+                send_reply(ev, cr.reply);
+                return;
+            }
+        }
+    }
 
     if (!g_cfg.auto_reply_enabled) return;
 
